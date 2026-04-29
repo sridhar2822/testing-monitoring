@@ -1,11 +1,12 @@
-FROM node:18
+FROM node:18-alpine
 
 WORKDIR /app
 
-COPY package.json .
-RUN npm install
+COPY package*.json ./
 
-COPY . . 
+RUN npm install --unsafe-perm
+
+COPY . .
 
 EXPOSE 3001
 
