@@ -1,0 +1,211 @@
+pipeline {
+    agent any
+
+    environment {
+        OUTPUT_DIR   = "${WORKSPACE}/outputs"
+        S3_BUCKET    = "locate-360-userapp"
+        AWS_REGION   = "us-east-1"
+        JAVA_HOME    = "/usr/lib/jvm/java-17-openjdk-amd64"
+        ANDROID_SDK  = "/home/kiaq-lap-91/android-sdk"
+    }
+
+    stages {
+        stage('1. Pre-Clean, Clone & Checkout') {
+            steps {
+                echo '🧹 Cleaning workspace and cloning repo...'
+                cleanWs()
+                withCredentials([usernamePassword(
+                    credentialsId: 'github-creds',
+                    usernameVariable: 'GIT_USER',
+                    passwordVariable: 'GIT_PASS'
+                )]) {
+                    sh '''
+                        rm -rf "$WORKSPACE"/* "$WORKSPACE"/.git || true
+                        git clone -b Native-dev https://${GIT_USER}:${GIT_PASS}@github.com/Locate360-Repo/Locate360-User-app.git "$WORKSPACE"
+                        echo "✅ Branch: $(git -C "$WORKSPACE" branch --show-current)"
+                        echo "✅ Latest commit: $(git -C "$WORKSPACE" log --oneline -1)"
+                        ls -la "$WORKSPACE"
+                        ls -la "$WORKSPACE"/android/
+                    '''
+                }
+            }
+        }
+
+        stage('2. Setup Environment') {
+            steps {
+                echo '⚙️ Verifying Java, Node and Android SDK...'
+                sh '''
+                    java -version
+                    node -v
+                    npm -v
+                    aws --version || true
+                '''
+            }
+        }
+
+        stage('2.5 Accept SDK Licenses') {
+            steps {
+                echo '📜 Accepting Android SDK and NDK licenses dynamically...'
+                sh '''
+                    mkdir -p "${ANDROID_SDK}/licenses"
+                    
+                    # Target the system's sdkmanager dynamically to auto-approve everything
+                    if [ -f "${ANDROID_SDK}/cmdline-tools/latest/bin/sdkmanager" ]; then
+                        yes | "${ANDROID_SDK}/cmdline-tools/latest/bin/sdkmanager" --licenses
+                    elif [ -f "${ANDROID_SDK}/tools/bin/sdkmanager" ]; then
+                        yes | "${ANDROID_SDK}/tools/bin/sdkmanager" --licenses
+                    else
+                        echo "⚠️ sdkmanager binary not found in standard paths, falling back to an explicit search..."
+                        SDK_MANAGER=$(find "${ANDROID_SDK}" -name "sdkmanager" | head -1)
+                        if [ -n "$SDK_MANAGER" ]; then
+                            yes | "$SDK_MANAGER" --licenses
+                        else
+                            echo "❌ Critical Error: Could not locate sdkmanager to accept licenses!"
+                            exit 1
+                        fi
+                    fi
+                    echo "✅ All Android SDK/NDK licenses successfully approved."
+                '''
+            }
+        }
+
+        stage('3. Install Dependencies') {
+            steps {
+                echo '📦 Installing Node dependencies...'
+                sh '''
+                    cd "$WORKSPACE"
+                    npm install --legacy-peer-deps
+                    echo "✅ npm install done"
+                '''
+            }
+        }
+
+        stage('4. Setup Debug Keystore') {
+            steps {
+                echo '🔑 Generating debug keystore if missing...'
+                sh '''
+                    mkdir -p "$WORKSPACE"/android/app
+                    if [ ! -f "$WORKSPACE"/android/app/debug.keystore ]; then
+                        keytool -genkey -v \
+                            -keystore "$WORKSPACE"/android/app/debug.keystore \
+                            -storepass android \
+                            -alias androiddebugkey \
+                            -keypass android \
+                            -keyalg RSA \
+                            -keysize 2048 \
+                            -validity 10000 \
+                            -dname "CN=Android Debug,O=Android,C=US"
+                        echo "✅ debug.keystore created"
+                    else
+                        echo "✅ debug.keystore already exists"
+                    fi
+                '''
+            }
+        }
+
+        stage('5. Verify Android Setup') {
+            steps {
+                echo '📂 Verifying android folder and gradlew...'
+                sh '''
+                    if [ ! -d "${ANDROID_SDK}/platform-tools" ]; then
+                        echo "❌ Android SDK not found at ${ANDROID_SDK}"
+                        exit 1
+                    fi
+
+                    echo "✅ SDK found at: ${ANDROID_SDK}"
+                    echo "sdk.dir=${ANDROID_SDK}" > "$WORKSPACE"/android/local.properties
+                    echo "✅ local.properties written:"
+                    cat "$WORKSPACE"/android/local.properties
+
+                    if [ ! -f "$WORKSPACE"/android/gradlew ]; then
+                        echo "❌ gradlew not found!"
+                        exit 1
+                    fi
+
+                    chmod +x "$WORKSPACE"/android/gradlew
+                    echo "✅ gradlew ready"
+                '''
+            }
+        }
+
+        stage('6. Build APK') {
+            steps {
+                echo '🏗️ Building Release APK...'
+                sh '''
+                    cd "$WORKSPACE"/android
+                    chmod +x gradlew
+
+                    export GRADLE_OPTS="-Xmx2g -XX:MaxMetaspaceSize=512m"
+                    export NODE_BINARY=$(which node)
+                    export ANDROID_HOME="${ANDROID_SDK}"
+                    export PATH="$WORKSPACE/node_modules/.bin:${ANDROID_SDK}/platform-tools:${ANDROID_SDK}/tools:$PATH"
+
+                    ./gradlew clean assembleRelease --no-daemon --stacktrace
+
+                    if [ -f app/build/outputs/apk/release/app-release.apk ]; then
+                        echo "✅ APK found:"
+                        ls -lh app/build/outputs/apk/release/
+                    else
+                        echo "❌ APK not found! Searching..."
+                        find . -name "*.apk" 2>/dev/null
+                        exit 1
+                    fi
+                '''
+            }
+        }
+
+        stage('7. Copy Output Files') {
+            steps {
+                echo '📁 Copying outputs...'
+                sh '''
+                    mkdir -p "$WORKSPACE"/outputs
+                    cp "$WORKSPACE"/android/app/build/outputs/apk/release/app-release.apk \
+                       "$WORKSPACE"/outputs/Locate360-User-app.apk
+                    echo "✅ APK copied"
+                    ls -lh "$WORKSPACE"/outputs/
+                '''
+            }
+        }
+
+        stage('8. Upload to S3') {
+            steps {
+                echo '☁️ Uploading APK to S3...'
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: 'aws-creds'
+                ]]) {
+                    sh '''
+                        aws s3 cp "$WORKSPACE"/outputs/Locate360-User-app.apk \
+                            s3://${S3_BUCKET}/releases/Locate360-${BUILD_NUMBER}.apk \
+                            --region ${AWS_REGION}
+
+                        aws s3 cp "$WORKSPACE"/outputs/Locate360-User-app.apk \
+                            s3://${S3_BUCKET}/latest/Locate360-latest.apk \
+                            --region ${AWS_REGION}
+
+                        echo "✅ Uploaded to S3 successfully"
+                        echo "🔗 Build URL: s3://${S3_BUCKET}/releases/Locate360-${BUILD_NUMBER}.apk"
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo """
+==================================================
+🎉 BUILD SUCCESS!
+APK : ${WORKSPACE}/outputs/Locate360-User-app.apk
+S3  : s3://${S3_BUCKET}/releases/Locate360-${BUILD_NUMBER}.apk
+==================================================
+"""
+        }
+        failure {
+            echo '❌ BUILD FAILED - Check Jenkins console logs above for details.'
+        }
+        always {
+            echo '🏁 Pipeline completed.'
+        }
+    }
+}
